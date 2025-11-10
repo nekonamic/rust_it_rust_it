@@ -6,6 +6,7 @@ use std::{
 
 use bevy::{
     asset::UnapprovedPathMode,
+    input::keyboard::KeyboardInput,
     prelude::*,
     window::{PresentMode, WindowResolution},
 };
@@ -121,6 +122,8 @@ fn main() {
             bpm: 0.,
         })
         .insert_resource(GameState { start_time: 0.0 })
+        .add_systems(FixedUpdate, print_key_input)
+        .insert_resource(Time::<Fixed>::from_hz(1000.0))
         .run();
 }
 
@@ -228,6 +231,7 @@ pub struct Note {
     pub time: f32,
     pub position_y: f32,
     pub wav_file: ObjId,
+    pub is_note: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,6 +328,7 @@ fn spawn_notes(
                     time: note_time,
                     position_y,
                     wav_file: wav_obj.wav_id,
+                    is_note: true,
                 },
             ));
         } else if lane == 63 {
@@ -336,6 +341,7 @@ fn spawn_notes(
                     time: note_time,
                     position_y,
                     wav_file: wav_obj.wav_id,
+                    is_note: true,
                 },
             ));
         } else if lane == 64 {
@@ -348,6 +354,7 @@ fn spawn_notes(
                     time: note_time,
                     position_y,
                     wav_file: wav_obj.wav_id,
+                    is_note: true,
                 },
             ));
         } else if lane == 65 {
@@ -360,6 +367,7 @@ fn spawn_notes(
                     time: note_time,
                     position_y,
                     wav_file: wav_obj.wav_id,
+                    is_note: true,
                 },
             ));
         } else if lane == 66 {
@@ -372,6 +380,7 @@ fn spawn_notes(
                     time: note_time,
                     position_y,
                     wav_file: wav_obj.wav_id,
+                    is_note: true,
                 },
             ));
         } else if lane == 67 {
@@ -384,6 +393,7 @@ fn spawn_notes(
                     time: note_time,
                     position_y,
                     wav_file: wav_obj.wav_id,
+                    is_note: true,
                 },
             ));
         } else if lane == 70 {
@@ -396,6 +406,7 @@ fn spawn_notes(
                     time: note_time,
                     position_y,
                     wav_file: wav_obj.wav_id,
+                    is_note: true,
                 },
             ));
         } else if lane == 71 {
@@ -408,6 +419,18 @@ fn spawn_notes(
                     time: note_time,
                     position_y,
                     wav_file: wav_obj.wav_id,
+                    is_note: true,
+                },
+            ));
+        } else if lane == 1 {
+            commands.spawn((
+                Transform::from_translation(Vec2::new(0., position_y).extend(0.)),
+                Note {
+                    lane,
+                    time: note_time,
+                    position_y,
+                    wav_file: wav_obj.wav_id,
+                    is_note: false,
                 },
             ));
         } else {
@@ -424,11 +447,11 @@ fn notes_fall(
     game_status: Res<GameState>,
 ) {
     let current_time = time.elapsed_secs();
+    let elapsed = current_time - game_status.start_time;
 
-    for (entity, mut transform, mut note) in query.iter_mut() {
-        let new_pos = note.position_y
-            + (JUDGEMENTLINE_POSITION.y - note.position_y)
-                * ((current_time - game_status.start_time) / note.time);
+    for (entity, mut transform, note) in query.iter_mut() {
+        let new_pos =
+            note.position_y + (JUDGEMENTLINE_POSITION.y - note.position_y) * (elapsed / note.time);
         transform.translation.y = new_pos;
 
         if transform.translation.y <= JUDGEMENTLINE_POSITION.y {
@@ -437,5 +460,20 @@ fn notes_fall(
                 audio.play(handle.clone());
             }
         }
+    }
+}
+
+fn print_key_input(
+    mut keyboard_input_events: MessageReader<KeyboardInput>,
+) {
+    for event in keyboard_input_events.read() {
+        println!(
+            "Physical key: {:?}, Logical key: {:?}, Text: {:?}, State: {:?}, Repeat: {}",
+            event.key_code,
+            event.logical_key,
+            event.text,
+            event.state,
+            event.repeat
+        );
     }
 }
