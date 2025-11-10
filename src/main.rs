@@ -1,11 +1,19 @@
-use std::path::PathBuf;
+use std::{
+    collections::HashMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use bevy::{
-    input::{ButtonState, keyboard::KeyboardInput},
+    asset::UnapprovedPathMode,
     prelude::*,
-    window::WindowResolution,
+    window::{PresentMode, WindowResolution},
 };
-use bms_rs::bms::{BmsOutput, parse_bms, prelude::KeyLayoutBeat};
+use bevy_kira_audio::prelude::*;
+use bms_rs::{
+    bms::{BmsOutput, parse_bms, prelude::KeyLayoutBeat},
+    command::ObjId,
+};
 use encoding_rs::SHIFT_JIS;
 use num_traits::ToPrimitive;
 
@@ -75,15 +83,26 @@ const NOTE7_L2R_RELATIVE_X: f32 = -(LANE_WIDTH / 2.)
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Rust*it!!Rust*it!!".into(),
-                name: Some("bevy.app".into()),
-                resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.),
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins((
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "Rust*it!!Rust*it!!".into(),
+                        name: Some("bevy.app".into()),
+                        resolution: WindowResolution::new(1920, 1080)
+                            .with_scale_factor_override(1.),
+                        present_mode: PresentMode::AutoNoVsync,
+                        ..default()
+                    }),
+                    ..default()
+                })
+                .set(AssetPlugin {
+                    unapproved_path_mode: UnapprovedPathMode::Allow,
+                    ..default()
+                }),
+            AudioPlugin,
+        ))
+        .insert_state(AppState::Loading)
         .add_systems(
             Startup,
             (
@@ -93,11 +112,15 @@ fn main() {
                 spawn_notes,
             ),
         )
-        .add_systems(Update, (keyboard_events, notes_fall))
+        .add_systems(
+            Update,
+            (controller, notes_fall.run_if(in_state(AppState::Playing))),
+        )
         .insert_resource(Config {
             speed: 800.,
             bpm: 0.,
         })
+        .insert_resource(GameState { start_time: 0.0 })
         .run();
 }
 
@@ -109,6 +132,18 @@ fn spawn_camera(mut commands: Commands) {
 struct Config {
     pub speed: f32,
     pub bpm: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, States)]
+enum AppState {
+    #[default]
+    Loading,
+    Playing,
+}
+
+#[derive(Resource)]
+struct GameState {
+    start_time: f32,
 }
 
 #[derive(Component)]
@@ -175,16 +210,15 @@ fn spawn_lane_border(
         });
 }
 
-fn keyboard_events(mut evr_kbd: MessageReader<KeyboardInput>) {
-    for ev in evr_kbd.read() {
-        match ev.state {
-            ButtonState::Pressed => {
-                println!("Key press: {:?} ({:?})", ev.key_code, ev.logical_key);
-            }
-            ButtonState::Released => {
-                println!("Key release: {:?} ({:?})", ev.key_code, ev.logical_key);
-            }
-        }
+fn controller(
+    mut next_state: ResMut<NextState<AppState>>,
+    input: Res<ButtonInput<KeyCode>>,
+    mut game_status: ResMut<GameState>,
+    time: Res<Time>,
+) {
+    if input.pressed(KeyCode::Space) {
+        next_state.set(AppState::Playing);
+        game_status.start_time = time.elapsed_secs();
     }
 }
 
@@ -193,6 +227,7 @@ pub struct Note {
     pub lane: u16,
     pub time: f32,
     pub position_y: f32,
+    pub wav_file: ObjId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,11 +248,34 @@ pub struct HitWindow {
     pub poor: f32,
 }
 
+#[derive(Resource)]
+struct AudioAssets {
+    map: HashMap<ObjId, Handle<AudioSource>>,
+}
+
+fn find_wav(path: &str) -> Option<PathBuf> {
+    let path = Path::new(path);
+    let parent = path.parent()?;
+    let stem = path.file_stem()?.to_string_lossy();
+
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with(&*stem) {
+                return Some(entry.path());
+            }
+        }
+    }
+
+    None
+}
+
 fn spawn_notes(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut config: ResMut<Config>,
+    asset_server: Res<AssetServer>,
 ) {
     let bytes = std::fs::read("bms/BLOODY ROSE/BLOODY ROSE_Unfulfilled.bms").unwrap();
     let (source, _encoding_used, _had_errors) = SHIFT_JIS.decode(&bytes);
@@ -227,14 +285,22 @@ fn spawn_notes(
     println!("Title: {}", bms.header.title.as_deref().unwrap(),);
 
     let wav_files = bms.notes.wav_files.clone();
-    for (.., mut pathbuf) in wav_files {
-        pathbuf = PathBuf::from("bms/BLOODY ROSE").join(pathbuf);
+
+    let mut audio_map = HashMap::new();
+    for (id, pathbuf) in wav_files {
+        let related_path = PathBuf::from("bms/BLOODY ROSE").join(&pathbuf);
+        let abs_path = env::current_dir().unwrap().join(&related_path);
+
+        if let Some(file) = find_wav(&abs_path.to_string_lossy()) {
+            let handle: Handle<AudioSource> = asset_server.load(file);
+            audio_map.insert(id, handle);
+        }
     }
+    commands.insert_resource(AudioAssets { map: audio_map });
 
     config.bpm = bms.arrangers.bpm.unwrap().to_f32().unwrap();
     let beat_interval = 60. * 4. / config.bpm;
 
-    let judgement_y = (1080. / 2.) - (LANE_HEIGHT - JUDGEMENTLINE_THICKNESS / 2.);
     let white_note_color = materials.add(Color::srgb(1., 1., 1.));
     let blue_note_color = materials.add(Color::srgb(0., 0., 1.));
     let scratch_color = materials.add(Color::srgb(1., 0., 0.));
@@ -244,7 +310,7 @@ fn spawn_notes(
         let note_track_with_fraction: f32 = wav_obj.offset.track.0 as f32
             + wav_obj.offset.numerator as f32 / wav_obj.offset.denominator as f32;
         let note_time = note_track_with_fraction * beat_interval;
-        let position_y = judgement_y + (note_time * config.speed);
+        let position_y = JUDGEMENTLINE_POSITION.y + (note_time * config.speed);
         let lane = wav_obj.channel_id.as_u16();
         if lane == 68 {
             commands.spawn((
@@ -257,6 +323,7 @@ fn spawn_notes(
                     lane,
                     time: note_time,
                     position_y,
+                    wav_file: wav_obj.wav_id,
                 },
             ));
         } else if lane == 63 {
@@ -268,6 +335,7 @@ fn spawn_notes(
                     lane,
                     time: note_time,
                     position_y,
+                    wav_file: wav_obj.wav_id,
                 },
             ));
         } else if lane == 64 {
@@ -279,6 +347,7 @@ fn spawn_notes(
                     lane,
                     time: note_time,
                     position_y,
+                    wav_file: wav_obj.wav_id,
                 },
             ));
         } else if lane == 65 {
@@ -290,6 +359,7 @@ fn spawn_notes(
                     lane,
                     time: note_time,
                     position_y,
+                    wav_file: wav_obj.wav_id,
                 },
             ));
         } else if lane == 66 {
@@ -301,6 +371,7 @@ fn spawn_notes(
                     lane,
                     time: note_time,
                     position_y,
+                    wav_file: wav_obj.wav_id,
                 },
             ));
         } else if lane == 67 {
@@ -312,6 +383,7 @@ fn spawn_notes(
                     lane,
                     time: note_time,
                     position_y,
+                    wav_file: wav_obj.wav_id,
                 },
             ));
         } else if lane == 70 {
@@ -323,6 +395,7 @@ fn spawn_notes(
                     lane,
                     time: note_time,
                     position_y,
+                    wav_file: wav_obj.wav_id,
                 },
             ));
         } else if lane == 71 {
@@ -334,6 +407,7 @@ fn spawn_notes(
                     lane,
                     time: note_time,
                     position_y,
+                    wav_file: wav_obj.wav_id,
                 },
             ));
         } else {
@@ -345,36 +419,23 @@ fn notes_fall(
     mut commands: Commands,
     time: Res<Time>,
     mut query: Query<(Entity, &mut Transform, &mut Note)>,
-    config: Res<Config>,
+    audio_assets: Res<AudioAssets>,
+    audio: Res<Audio>,
+    game_status: Res<GameState>,
 ) {
-    let delta = time.delta_secs();
-    let judgement_y = (1080. / 2.) - (LANE_HEIGHT - JUDGEMENTLINE_THICKNESS / 2.);
+    let current_time = time.elapsed_secs();
 
     for (entity, mut transform, mut note) in query.iter_mut() {
-        transform.translation.y -= config.speed * delta;
-        note.position_y = transform.translation.y;
+        let new_pos = note.position_y
+            + (JUDGEMENTLINE_POSITION.y - note.position_y)
+                * ((current_time - game_status.start_time) / note.time);
+        transform.translation.y = new_pos;
 
-        if transform.translation.y <= judgement_y {
-            // 在这里销毁该 note 实体
+        if transform.translation.y <= JUDGEMENTLINE_POSITION.y {
             commands.entity(entity).despawn();
-        }
-    }
-}
-
-fn auto_play(
-    time: Res<Time>,
-    mut query: Query<(&mut Transform, &mut Note)>,
-    config: ResMut<Config>,
-) {
-    let delta = time.delta_secs();
-    let judgement_y = (1080. / 2.) - (LANE_HEIGHT - JUDGEMENTLINE_THICKNESS / 2.);
-
-    for (mut transform, mut note) in query.iter_mut() {
-        transform.translation.y -= config.speed * delta;
-        note.position_y = transform.translation.y;
-
-        if transform.translation.y <= judgement_y {
-            transform.translation.y = judgement_y;
+            if let Some(handle) = audio_assets.map.get(&note.wav_file) {
+                audio.play(handle.clone());
+            }
         }
     }
 }
