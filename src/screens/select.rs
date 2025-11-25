@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use bevy::{prelude::*, sprite::Anchor};
+use bevy::{color::palettes::css::*, prelude::*, sprite::Anchor};
 use bms_rs::bms::{BmsOutput, model::Header, parse_bms, prelude::KeyLayoutBeat};
 use encoding_rs::SHIFT_JIS;
 use num_traits::ToPrimitive;
@@ -60,6 +60,7 @@ fn spawn_select(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut data: ResMut<BmsLib>,
+    asset_server: Res<AssetServer>,
 ) {
     for entry in WalkDir::new(BMS_PATH) {
         let entry = match entry {
@@ -97,6 +98,7 @@ fn spawn_select(
     let selected_border_color = materials.add(Color::srgb(1., 0., 0.));
 
     let text_font = TextFont {
+        font: asset_server.load("fonts/KosugiMaru-Regular.ttf"),
         font_size: 50.0,
         ..default()
     };
@@ -175,20 +177,52 @@ fn spawn_select(
         .with_children(|parent| {
             for (i, header) in data.bms_arr.iter().enumerate() {
                 let title = header.header.title.clone().unwrap();
+                let difficulty = header.header.difficulty.clone().unwrap_or(0);
+                let play_level = header.header.play_level.clone().unwrap_or(0);
                 let stack_y = -(i as f32) * (LINE_HEIGHT + BORDER_THICKNESS * 3.);
+
+                let play_level_color = match difficulty {
+                    0 => GRAY,
+                    1 => GREEN,
+                    2 => BLUE,
+                    3 => YELLOW,
+                    4 => RED,
+                    5 => PURPLE,
+                    _ => GRAY,
+                };
 
                 parent
                     .spawn((
-                        Text2d::new(title),
-                        text_font.clone(),
-                        TextLayout::new_with_justify(Justify::Left),
                         Transform::from_translation(
                             Vec2::new(RIGHT_OFFSET - LINE_WIDTH / 2., stack_y).extend(0.),
                         ),
-                        Anchor::CENTER_LEFT,
                         SelectItem,
                     ))
                     .with_children(|parent| {
+                        let text_offset_x = 2.0;
+                        let play_level_width = 50.0;
+
+                        parent.spawn((
+                            Text2d::new(play_level.to_string()),
+                            TextColor(play_level_color.into()),
+                            text_font.clone(),
+                            TextLayout::new_with_justify(Justify::Left),
+                            Transform::from_translation(
+                                Vec2::new(text_offset_x, 0.).extend(0.),
+                            ),
+                            Anchor::CENTER_LEFT,
+                        ));
+
+                        parent.spawn((
+                            Text2d::new(title),
+                            text_font.clone(),
+                            TextLayout::new_with_justify(Justify::Left),
+                            Transform::from_translation(
+                                Vec2::new(text_offset_x + play_level_width, 0.).extend(0.),
+                            ),
+                            Anchor::CENTER_LEFT,
+                        ));
+
                         // 上
                         parent.spawn((
                             Mesh2d(meshes.add(Rectangle::new(LINE_WIDTH, BORDER_THICKNESS))),

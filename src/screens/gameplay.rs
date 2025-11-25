@@ -95,16 +95,14 @@ const TIMING_WINDOW: TimingWindow = TimingWindow {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Segment {
-    pub t_start: f32,  // 段开始时间
-    pub t_end: f32,    // 段结束时间
-    pub velocity: f32, // 此段速度
+    pub t_start: f32,
+    pub t_end: f32,
+    pub velocity: f32,
 }
 
 pub fn compute_position(tnote: f32, telapse: f32, mut changes: Vec<(f32, f32)>) -> f32 {
-    // 1. 按时间排序
     changes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-    // 2. 构造 segments
     let mut segments = Vec::new();
     for i in 0..changes.len() {
         let (t_start, v) = changes[i];
@@ -116,14 +114,11 @@ pub fn compute_position(tnote: f32, telapse: f32, mut changes: Vec<(f32, f32)>) 
         segments.push((t_start, t_end, v));
     }
 
-    // 3. 积分速度得到位置
     let mut pos = 0.0;
     for (t_start, t_end, v) in segments {
         if telapse >= t_end {
-            // 整段完全落在 telapse 之前，全部积分
             pos += (t_end - t_start) * v;
         } else if telapse > t_start {
-            // telapse 落在这个 segment 内，积分到 telapse
             pos += (telapse - t_start) * v;
             break;
         } else {
@@ -166,7 +161,6 @@ struct KeySound {
 #[derive(Resource)]
 struct PlayStatus {
     green_number: u32,
-    speed: f32,
     bpm: f32,
     start_time: f32,
 }
@@ -218,7 +212,7 @@ impl Lane {
 struct Note {
     time: f32,
     wav_file: ObjId,
-    note_track_with_fraction: f32,
+    real_crotchet: f32,
 }
 
 #[derive(Component)]
@@ -232,9 +226,6 @@ struct BPMEvent {
     bpm: f32,
     time: f32,
 }
-
-#[derive(Resource)]
-struct BPMChanges(pub Vec<(f32, f32)>);
 
 fn spawn_judgement_line(
     mut commands: Commands,
@@ -342,13 +333,19 @@ struct Interval {
     value: f64,
 }
 
+#[derive(Resource)]
+struct PositionCalculator {
+    crotchet_calculator: Crotchet,
+    time_calculator: BpmCrotchetFunction,
+}
+
 #[derive(Debug, Clone)]
 struct BpmCrotchetFunction {
     intervals: Vec<Interval>,
 }
 
 impl BpmCrotchetFunction {
-    fn bpm_time_function(&self, x: f64) -> f64 {
+    fn crotchet_time_function(&self, x: f64) -> f64 {
         if x <= 0.0 {
             return 0.0;
         }
@@ -398,6 +395,93 @@ impl BpmCrotchetFunction {
         }
 
         acc
+    }
+
+    pub fn inverse_integral(&self, y: f64) -> f64 {
+        if y <= 0.0 {
+            return 0.0;
+        }
+
+        let mut acc_integral = 0.0;
+        let mut current_x = 0.0;
+
+        for it in &self.intervals {
+            let v = it.value;
+
+            let seg_start = it.start.max(current_x);
+            let seg_end = it.end;
+            let seg_len = seg_end - seg_start;
+
+            if seg_len <= 0.0 {
+                continue;
+            }
+
+            let max_contribution = 60.0 * seg_len / v;
+
+            if acc_integral + max_contribution >= y {
+                let needed = y - acc_integral;
+                let dx = needed * v / 60.0;
+                return seg_start + dx;
+            }
+
+            acc_integral += max_contribution;
+            current_x = seg_end;
+        }
+
+        let last = self.intervals.last().unwrap();
+        let v = last.value;
+
+        let needed = y - acc_integral;
+        let dx = needed * v / 60.0;
+
+        current_x + dx
+    }
+
+    pub fn distance(&self, x1: f64, x2: f64) -> f64 {
+        let mut left = x1.min(x2);
+        let right = x1.max(x2);
+
+        if left == right {
+            return 0.0;
+        }
+
+        let mut result = 0.0;
+
+        let mut F_a = 0.0;
+
+        for it in &self.intervals {
+            let v = it.value;
+
+            let seg_start = it.start;
+            let seg_end = it.end;
+
+            let seg_len = if seg_end.is_infinite() {
+                f64::INFINITY
+            } else {
+                seg_end - seg_start
+            };
+
+            let F_b = if seg_len.is_infinite() {
+                f64::INFINITY
+            } else {
+                F_a + 60.0 * seg_len / v
+            };
+
+            let xs = F_a.max(left);
+            let xe = F_b.min(right);
+
+            if xe > xs {
+                result += (xe - xs) * v;
+            }
+
+            if F_b >= right {
+                break;
+            }
+
+            F_a = F_b;
+        }
+
+        result
     }
 }
 
@@ -463,7 +547,7 @@ fn spawn_notes(
     }
     commands.insert_resource(AudioAssets { map: audio_map });
 
-    let mut bpm = bms.arrangers.bpm.clone().unwrap().to_f32().unwrap();
+    let bpm = bms.arrangers.bpm.clone().unwrap().to_f32().unwrap();
     let green_number = 500;
 
     let mut section_len_changes_hashmap: HashMap<u64, f64> = HashMap::new();
@@ -480,29 +564,64 @@ fn spawn_notes(
     };
 
     let mut bpm_changes_interval: Vec<Interval> = vec![];
+    bpm_changes_interval.push(Interval {
+        start: 0.,
+        end: f64::INFINITY,
+        value: bpm.clone() as f64,
+    });
     let bpm_changes = &bms.arrangers.bpm_changes;
-    for (_, bpm_change_obj) in bpm_changes {
-        bpm_changes_interval.push(
-            start: 
-            (crotchet.get_crotchet(
-                bpm_change_obj.time.track.0,
-                bpm_change_obj.time.numerator as f64 / bpm_change_obj.time.denominator as f64,
-            ), bpm_change_obj.bpm.to_f64().unwrap()),
+    for (index, bpm_change) in bpm_changes.into_iter().enumerate() {
+        let real_crotchet = crotchet.get_crotchet(
+            bpm_change.1.time.track.0,
+            bpm_change.1.time.numerator as f64 / bpm_change.1.time.denominator as f64,
         );
+        bpm_changes_interval[index].end = real_crotchet;
+        bpm_changes_interval.push(Interval {
+            start: real_crotchet,
+            end: f64::INFINITY,
+            value: bpm_change.1.bpm.to_f64().unwrap(),
+        });
     }
-    let bpm_crotchet_function = BpmCrotchetFunction { bpm_changes_arr };
+    let crotchet_crotchet_function = BpmCrotchetFunction {
+        intervals: bpm_changes_interval,
+    };
+
+    commands.insert_resource(PositionCalculator {
+        crotchet_calculator: crotchet.clone(),
+        time_calculator: crotchet_crotchet_function.clone(),
+    });
 
     let white_note_color = materials.add(Color::srgb(1., 1., 1.));
     let blue_note_color = materials.add(Color::srgb(0., 0., 1.));
     let scratch_color = materials.add(Color::srgb(1., 0., 0.));
 
+    commands.insert_resource(PlayStatus {
+        green_number: green_number.clone(),
+        bpm: bpm.clone(),
+        start_time: 0.,
+    });
+
+    for (_, bpm_change) in bpm_changes.into_iter().enumerate() {
+        let real_crotchet = crotchet.get_crotchet(
+            bpm_change.1.time.track.0,
+            bpm_change.1.time.numerator as f64 / bpm_change.1.time.denominator as f64,
+        );
+        commands.spawn((BPMEvent {
+            bpm: bpm_change.1.bpm.to_f32().unwrap(),
+            time: crotchet_crotchet_function.crotchet_time_function(real_crotchet) as f32,
+        },));
+    }
+
     let all_note = bms.notes.all_notes();
     for wav_obj in all_note {
-        let note_track_with_fraction: f32 = wav_obj.offset.track.0 as f32
-            + wav_obj.offset.numerator as f32 / wav_obj.offset.denominator as f32;
-        let note_time = note_track_with_fraction * beat_interval;
+        let real_crotchet = crotchet.get_crotchet(
+            wav_obj.offset.track.0,
+            wav_obj.offset.numerator as f64 / wav_obj.offset.denominator as f64,
+        );
+        let note_time = crotchet_crotchet_function.crotchet_time_function(real_crotchet) as f32;
         let speed = LANE_HEIGHT / (green_number as f32 / 10. / 60.);
-        let position_y = JUDGEMENTLINE_POSITION.y + (note_time * speed);
+        let position_y = JUDGEMENTLINE_POSITION.y
+            + 2.5 * crotchet_crotchet_function.distance(0., note_time as f64) as f32;
         let lane = wav_obj.channel_id.as_u16();
         if lane == 68 {
             let lane_entity = lane_query
@@ -520,7 +639,7 @@ fn spawn_notes(
                     Note {
                         time: note_time,
                         wav_file: wav_obj.wav_id,
-                        note_track_with_fraction: note_track_with_fraction,
+                        real_crotchet: real_crotchet as f32,
                     },
                 ));
             });
@@ -540,7 +659,7 @@ fn spawn_notes(
                     Note {
                         time: note_time,
                         wav_file: wav_obj.wav_id,
-                        note_track_with_fraction: note_track_with_fraction,
+                        real_crotchet: real_crotchet as f32,
                     },
                 ));
             });
@@ -560,7 +679,7 @@ fn spawn_notes(
                     Note {
                         time: note_time,
                         wav_file: wav_obj.wav_id,
-                        note_track_with_fraction: note_track_with_fraction,
+                        real_crotchet: real_crotchet as f32,
                     },
                 ));
             });
@@ -580,7 +699,7 @@ fn spawn_notes(
                     Note {
                         time: note_time,
                         wav_file: wav_obj.wav_id,
-                        note_track_with_fraction: note_track_with_fraction,
+                        real_crotchet: real_crotchet as f32,
                     },
                 ));
             });
@@ -600,7 +719,7 @@ fn spawn_notes(
                     Note {
                         time: note_time,
                         wav_file: wav_obj.wav_id,
-                        note_track_with_fraction: note_track_with_fraction,
+                        real_crotchet: real_crotchet as f32,
                     },
                 ));
             });
@@ -620,7 +739,7 @@ fn spawn_notes(
                     Note {
                         time: note_time,
                         wav_file: wav_obj.wav_id,
-                        note_track_with_fraction: note_track_with_fraction,
+                        real_crotchet: real_crotchet as f32,
                     },
                 ));
             });
@@ -640,7 +759,7 @@ fn spawn_notes(
                     Note {
                         time: note_time,
                         wav_file: wav_obj.wav_id,
-                        note_track_with_fraction: note_track_with_fraction,
+                        real_crotchet: real_crotchet as f32,
                     },
                 ));
             });
@@ -660,7 +779,7 @@ fn spawn_notes(
                     Note {
                         time: note_time,
                         wav_file: wav_obj.wav_id,
-                        note_track_with_fraction: note_track_with_fraction,
+                        real_crotchet: real_crotchet as f32,
                     },
                 ));
             });
@@ -679,15 +798,29 @@ fn spawn_notes(
 }
 
 fn notes_fall(
+    mut commands: Commands,
     time: Res<Time>,
-    mut query: Query<(&mut Transform, &mut Note)>,
-    mut status: ResMut<PlayStatus>,
+    mut query: Query<(Entity, &mut Transform, &mut Note)>,
+    status: ResMut<PlayStatus>,
+    calculator: ResMut<PositionCalculator>,
 ) {
     let current_time = time.elapsed_secs();
     let elapsed = current_time - status.start_time;
 
-    for (mut transform, note) in query.iter_mut() {
-        let new_pos = JUDGEMENTLINE_POSITION.y + (note.time - elapsed) * status.speed;
+    let speed = LANE_HEIGHT / (status.green_number as f32 / 10. / 60.);
+
+    for (entity, mut transform, note) in query.iter_mut() {
+        if note.time <= elapsed - TIMING_WINDOW.good {
+            commands.entity(entity).despawn()
+        }
+        let distance = calculator
+            .time_calculator
+            .distance(elapsed as f64, note.time as f64) as f32;
+        let new_pos = if note.time <= elapsed {
+            JUDGEMENTLINE_POSITION.y - 2.5 * distance
+        } else {
+            JUDGEMENTLINE_POSITION.y + 2.5 * distance
+        };
         transform.translation.y = new_pos;
     }
 }
@@ -709,24 +842,6 @@ fn play_bgm(
             if let Some(handle) = audio_assets.map.get(&bgm_event.wav_file) {
                 audio.play(handle.clone());
             }
-        }
-    }
-}
-
-fn handel_bpm(
-    mut commands: Commands,
-    time: Res<Time>,
-    mut query: Query<(Entity, &mut BPMEvent)>,
-    mut status: ResMut<PlayStatus>,
-) {
-    let current_time = time.elapsed_secs();
-    let elapsed = current_time - status.start_time;
-
-    for (entity, bpm_event) in query.iter_mut() {
-        if bpm_event.time <= elapsed {
-            commands.entity(entity).despawn();
-        } else {
-            break;
         }
     }
 }
